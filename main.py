@@ -1,64 +1,50 @@
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import StreamingResponse
 import pandas as pd
 import numpy as np
 import io
-import json
 
 app = FastAPI(title="Payroll Automation API")
 
-def parse_rates_json(rates_json_str: str):
-    """
-    Parses rates provided dynamically from Make.com (sourced from Google Sheet).
-    Expected JSON structure:
-    {
-        "Cooper Kelly": {"rate": 40.0, "loading": 18.0},
-        "Ayman X": {"rate": 40.0, "loading": 18.0},
-        "DEFAULT": {"rate": 40.0, "loading": 18.0}
-    }
-    """
-    default_rates = {"rate": 40.0, "loading": 18.0}
-    if not rates_json_str:
-        return {"DEFAULT": default_rates}
-    
-    try:
-        rates_dict = json.loads(rates_json_str)
-        if "DEFAULT" not in rates_dict:
-            rates_dict["DEFAULT"] = default_rates
-        return rates_dict
-    except Exception:
-        return {"DEFAULT": default_rates}
+# Hardcoded Rates Mapping
+# Default: Rate = 40.0, Loading = 18.0 (Ratio-based)
+# Exceptions: Christian & Ayman maintain the exact same ratio
+EMPLOYEE_RATES = {
+    "DEFAULT": {"rate": 40.0, "loading": 18.0},
+    "christian": {"rate": 40.0, "loading": 18.0},
+    "ayman": {"rate": 40.0, "loading": 18.0},
+}
 
-def get_employee_rate(fname, lname, rates_dict):
-    # Combine First Name + Last Name to form a Unique Identifier (UID)
+def get_employee_rate(fname, lname):
     full_name = f"{str(fname).strip()} {str(lname).strip()}".strip().lower()
     
-    # Check exact full name match in lower case
-    for name_key, rates in rates_dict.items():
-        if name_key.lower() == full_name:
-            return float(rates.get("rate", 40.0)), float(rates.get("loading", 18.0))
+    # Check for name exceptions using Full Name search
+    for name_key, rates in EMPLOYEE_RATES.items():
+        if name_key != "DEFAULT" and name_key in full_name:
+            return rates["rate"], rates["loading"]
             
-    # Fallback to DEFAULT rates
-    default = rates_dict.get("DEFAULT", {"rate": 40.0, "loading": 18.0})
-    return float(default.get("rate", 40.0)), float(default.get("loading", 18.0))
+    # Fallback to default $40 rate and $18 loading
+    return EMPLOYEE_RATES["DEFAULT"]["rate"], EMPLOYEE_RATES["DEFAULT"]["loading"]
 
-def calculate_alberta_ot(df, rates_dict):
+def calculate_alberta_ot(df):
     df['local_date'] = pd.to_datetime(df['local_date'])
     df['hours'] = df['hours'].astype(float)
     
-    # Sort data by unique full name + start time
+    # Generate Unique Full Name Identifier (UID)
     df['full_name'] = df['fname'].astype(str).str.strip() + " " + df['lname'].astype(str).str.strip()
+    
+    # Sort logically
     df = df.sort_values(by=['full_name', 'local_date', 'local_start_time']).reset_index(drop=True)
     
-    # Group by Unique Full Name and Date for Daily OT calculation
+    # Group by Full Name UID and Date for Daily OT
     daily = df.groupby(['full_name', 'local_date'])['hours'].sum().reset_index()
     daily['daily_reg'] = daily['hours'].apply(lambda h: min(h, 8.0))
     daily['daily_ot'] = daily['hours'].apply(lambda h: max(0.0, h - 8.0))
     
-    # Add ISO Year-Week identifier (Monday as start of week)
+    # Add ISO Year-Week identifier (Monday start)
     daily['year_week'] = daily['local_date'].dt.strftime('%G-%V')
     
-    # Calculate weekly cumulative regular hours to enforce Alberta > 44h rule
+    # Calculate weekly cumulative regular hours for Alberta > 44h rule
     daily['weekly_cum_reg'] = daily.groupby(['full_name', 'year_week'])['daily_reg'].cumsum()
     
     def apply_weekly_cap(row):
@@ -76,14 +62,14 @@ def calculate_alberta_ot(df, rates_dict):
             
     daily[['final_reg', 'final_ot']] = daily.apply(apply_weekly_cap, axis=1)
     
-    # Merge back to original shift entries
+    # Merge back to original shift records
     df = df.merge(
         daily[['full_name', 'local_date', 'hours', 'final_reg', 'final_ot']],
         on=['full_name', 'local_date'],
         suffixes=('', '_daily_total')
     )
     
-    # Pro-rate shift hours
+    # Pro-rate hours for multiple daily shifts
     df['shift_ratio'] = np.where(df['hours_daily_total'] > 0, df['hours'] / df['hours_daily_total'], 0)
     df['Reg'] = (df['final_reg'] * df['shift_ratio']).round(2)
     df['OT'] = (df['final_ot'] * df['shift_ratio']).round(2)
@@ -93,8 +79,8 @@ def calculate_alberta_ot(df, rates_dict):
     df['Hours'] = df['Adj Total'].apply(lambda x: int(np.floor(x)))
     df['Minutes'] = df['Adj Total'].apply(lambda x: int(round((x % 1) * 60)))
     
-    # Apply Loaded Rates using Full Name UID + Rates Dict
-    rates = df.apply(lambda r: get_employee_rate(r['fname'], r['lname'], rates_dict), axis=1)
+    # Apply Hardcoded Rates using Full Name UID
+    rates = df.apply(lambda r: get_employee_rate(r['fname'], r['lname']), axis=1)
     df['Rate'] = [r[0] for r in rates]
     df['Loading'] = [r[1] for r in rates]
     df['Adj Rate'] = df['Rate'] + df['Loading']
@@ -117,21 +103,14 @@ def calculate_alberta_ot(df, rates_dict):
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "message": "Payroll API with Dynamic Rates is running."}
+    return {"status": "ok", "message": "Payroll API is running successfully."}
 
 @app.post("/process-timesheet")
-async def process_timesheet(
-    file: UploadFile = File(...),
-    rates_json: str = Form(None)  # Optional JSON string sent from Make.com
-):
+async def process_timesheet(file: UploadFile = File(...)):
     contents = await file.read()
     df_raw = pd.read_csv(io.BytesIO(contents))
     
-    # Parse rates passed dynamically from Google Sheet
-    rates_dict = parse_rates_json(rates_json)
-    
-    # Process Payroll
-    df_processed = calculate_alberta_ot(df_raw, rates_dict)
+    df_processed = calculate_alberta_ot(df_raw)
     
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
