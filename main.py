@@ -119,7 +119,6 @@ def calculate_alberta_ot(df):
     
     df['Job'] = ""
     
-    # 插入 jobcode_2 於 jobcode_1 旁
     output_cols = [
         'fname', 'lname', 'local_date', 'local_day', 'local_start_time', 'local_end_time',
         'hours', 'Reg', 'OT', 'Adj Total', 'Hours', 'Minutes',
@@ -133,8 +132,14 @@ def calculate_alberta_ot(df):
             
     df = df[output_cols]
 
-    # 按 jobcode_1 排序
-    df = df.sort_values(by='jobcode_1', ascending=True).reset_index(drop=True)
+    # ----------------------------------------------------
+    # 多層排序：1. jobcode_1  2. local_date (舊到新)  3. fname (A-Z)
+    # ----------------------------------------------------
+    df = df.sort_values(
+        by=['jobcode_1', 'local_date', 'fname'],
+        ascending=[True, True, True]
+    ).reset_index(drop=True)
+
     return df
 
 @app.get("/")
