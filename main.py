@@ -3,6 +3,7 @@ from fastapi.responses import StreamingResponse
 import pandas as pd
 import numpy as np
 import io
+from openpyxl.styles import PatternFill
 
 app = FastAPI(title="Payroll Automation API")
 
@@ -36,7 +37,8 @@ def calculate_alberta_ot(df):
     df['full_name'] = df['fname'].astype(str).str.strip() + " " + df['lname'].astype(str).str.strip()
     df['full_name_clean'] = df['full_name'].str.lower().str.strip()
     
-    for col in ['jobcode_1', 'class', 'service item']:
+    # 包含 jobcode_2 欄位預處理
+    for col in ['jobcode_1', 'jobcode_2', 'class', 'service item']:
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].astype(str).str.strip()
@@ -49,10 +51,7 @@ def calculate_alberta_ot(df):
     # ----------------------------------------------------
     # Rule 1 & 2: 執行 Pruning (Jobcodes, Admin Class & Exception Employees)
     # ----------------------------------------------------
-    # 檢查是否屬於排除名單員工
     is_excluded_user = df['full_name_clean'].isin(EXCLUDED_EMPLOYEES)
-    
-    # 檢查是否屬於排除類別 (jobcode_1, class, 或 service item)
     is_excluded_jobcode = df['jobcode_1'].str.lower().isin(EXCLUDED_JOBCODES)
     is_admin_class = (
         df['class'].str.lower().str.contains('admin', na=False) |
@@ -110,30 +109,33 @@ def calculate_alberta_ot(df):
     df['Minutes'] = df['Adj Total'].apply(lambda x: int(round((x % 1) * 60)))
     
     # ----------------------------------------------------
-    # Rule 4 & Rule 5: 套用費率與 Jobber 高精度 Dollars 計算
+    # 套用費率與 Jobber 高精度 Dollars 計算
     # ----------------------------------------------------
     rates = df.apply(lambda r: get_employee_rate(r['fname'], r['lname']), axis=1)
     df['Rate'] = [r[0] for r in rates]
     df['Loading'] = [r[1] for r in rates]
     df['Adj Rate'] = df['Rate'] + df['Loading']
-    
-    # Rule 5: 模擬 Jobber 高精度換算 Dollars (Hours + Minutes / 60) * Adj Rate
     df['Dollars'] = ((df['Hours'] + (df['Minutes'] / 60.0)) * df['Adj Rate']).round(2)
     
     df['Job'] = ""
     
+    # 插入 jobcode_2 於 jobcode_1 旁
     output_cols = [
         'fname', 'lname', 'local_date', 'local_day', 'local_start_time', 'local_end_time',
         'hours', 'Reg', 'OT', 'Adj Total', 'Hours', 'Minutes',
         'Rate', 'Loading', 'Adj Rate', 'Dollars', 'Job',
-        'jobcode_1', 'class', 'service item', 'notes', 'approved_status'
+        'jobcode_1', 'jobcode_2', 'class', 'service item', 'notes', 'approved_status'
     ]
     
     for col in output_cols:
         if col not in df.columns:
             df[col] = ""
             
-    return df[output_cols]
+    df = df[output_cols]
+
+    # 按 jobcode_1 排序
+    df = df.sort_values(by='jobcode_1', ascending=True).reset_index(drop=True)
+    return df
 
 @app.get("/")
 def health_check():
@@ -149,6 +151,21 @@ async def process_timesheet(file: UploadFile = File(...)):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df_processed.to_excel(writer, index=False, sheet_name='Processed Payroll')
+        ws = writer.sheets['Processed Payroll']
+        
+        # 取得 Hours 與 Minutes 欄位索引 (1-based)
+        hours_col_idx = df_processed.columns.get_loc('Hours') + 1
+        minutes_col_idx = df_processed.columns.get_loc('Minutes') + 1
+        
+        # 定義背景填滿色彩
+        fill_hours = PatternFill(start_color="EAD1DC", end_color="EAD1DC", fill_type="solid")
+        fill_minutes = PatternFill(start_color="D9D2E9", end_color="D9D2E9", fill_type="solid")
+        
+        # 套用顏色至整欄 (包含標題與數據列)
+        for row in range(1, ws.max_row + 1):
+            ws.cell(row=row, column=hours_col_idx).fill = fill_hours
+            ws.cell(row=row, column=minutes_col_idx).fill = fill_minutes
+
     output.seek(0)
     
     filename = file.filename.replace('.csv', '_Processed.xlsx')
