@@ -1,11 +1,26 @@
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, File, UploadFile, Header, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
 import pandas as pd
 import numpy as np
 import io
+import os
 from openpyxl.styles import PatternFill
 
 app = FastAPI(title="Payroll Automation API")
+
+# ----------------------------------------------------
+# Simple shared-secret auth. This endpoint receives real payroll data (names, hours,
+# wages), so it should not be callable by anyone who finds the Render URL. Set the
+# PAYROLL_API_KEY environment variable in the Render dashboard, and configure Make.com's
+# HTTP module to send the same value in an "X-API-Key" header. If PAYROLL_API_KEY is not
+# set on the server, the check is skipped (local testing only - do not deploy this way).
+# ----------------------------------------------------
+EXPECTED_API_KEY = os.environ.get("PAYROLL_API_KEY")
+
+
+def verify_api_key(x_api_key: str = Header(default=None)):
+    if EXPECTED_API_KEY and x_api_key != EXPECTED_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
 # ----------------------------------------------------
 # Rule 4: Employee-specific loaded rates
@@ -108,7 +123,7 @@ def calculate_alberta_ot(df):
     # ----------------------------------------------------
     df = flag_lunch_breaks(df)
 
-    # Mark OT-exempt rows (Lunch break / Downtime, per Aug 9 correction). These entries
+    # Mark OT-exempt rows (Lunch break only, per Aug 9 correction). These entries
     # are excluded from the OT allocation below - they always get paid straight time for
     # their actual hours, and never absorb any of the day's overtime.
     df["is_ot_exempt"] = df["jobcode_1"].str.lower().isin(OT_EXEMPT_JOBCODES)
@@ -238,17 +253,48 @@ def calculate_alberta_ot(df):
     return df
 
 
+REQUIRED_COLUMNS = ["fname", "lname", "local_date", "local_start_time", "local_end_time", "hours", "jobcode_1"]
+
+
 @app.get("/")
 def health_check():
     return {"status": "ok", "message": "Payroll API is running successfully."}
 
 
 @app.post("/process-timesheet")
-async def process_timesheet(file: UploadFile = File(...)):
-    contents = await file.read()
-    df_raw = pd.read_csv(io.BytesIO(contents))
+async def process_timesheet(file: UploadFile = File(...), x_api_key: str = Header(default=None)):
+    verify_api_key(x_api_key)
 
-    df_processed = calculate_alberta_ot(df_raw)
+    contents = await file.read()
+    try:
+        df_raw = pd.read_csv(io.BytesIO(contents))
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Could not read the file as a CSV. Please confirm it's the raw QBO timesheet export."},
+        )
+
+    missing = [c for c in REQUIRED_COLUMNS if c not in df_raw.columns]
+    if missing:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"The uploaded file is missing expected column(s): {', '.join(missing)}. "
+                               f"This usually means it isn't the raw QBO export, or QBO changed its export format."},
+        )
+
+    try:
+        df_processed = calculate_alberta_ot(df_raw)
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Processing failed: {str(e)}. Please forward this file to Josef for review."},
+        )
+
+    if df_processed.empty:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "No billable rows remained after pruning. Please check the uploaded file."},
+        )
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
